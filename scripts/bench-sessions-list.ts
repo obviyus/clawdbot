@@ -6,17 +6,26 @@ import type { SessionsListResult } from "../src/gateway/session-utils.types.js";
 import { DEFAULT_SOURCE_ROOT, seedRealSessions } from "./bench-sessions-list-seed.js";
 
 type BenchOptions = {
+  activeMinutes?: number;
+  agentCount?: number;
+  agentId?: string;
   coldRuns: number;
+  includeGlobal: boolean;
   includeDerivedTitles: boolean;
   includeLastMessage: boolean;
+  includeUnknown: boolean;
   inflateTranscriptKiB: number;
   json: boolean;
   keepTemp: boolean;
+  limit?: number;
   output?: string;
+  recentSessions?: number;
+  recentWindowMinutes: number;
   runs: number;
   sessions: number;
   sourceRoot: string;
   sourceStore?: string;
+  targetWrittenMiB: number;
   warmup: number;
 };
 
@@ -61,10 +70,34 @@ function positiveInt(flag: string, defaultValue: number): number {
   return parsed;
 }
 
+function optionalPositiveInt(flag: string): number | undefined {
+  const raw = flagValue(flag);
+  if (raw === undefined) {
+    return undefined;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${flag} must be a positive integer`);
+  }
+  return parsed;
+}
+
 function nonNegativeInt(flag: string, defaultValue: number): number {
   const raw = flagValue(flag);
   if (raw === undefined) {
     return defaultValue;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${flag} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+function optionalNonNegativeInt(flag: string): number | undefined {
+  const raw = flagValue(flag);
+  if (raw === undefined) {
+    return undefined;
   }
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed < 0) {
@@ -79,18 +112,28 @@ function parseOptions(): BenchOptions {
     process.exit(0);
   }
   const sourceStore = flagValue("--source-store");
+  const agentId = flagValue("--agent-id")?.trim();
   return {
+    activeMinutes: optionalPositiveInt("--active-minutes"),
+    agentCount: optionalPositiveInt("--agent-count"),
+    agentId: agentId || undefined,
     coldRuns: nonNegativeInt("--cold-runs", DEFAULT_COLD_RUNS),
+    includeGlobal: !hasFlag("--exclude-global"),
     includeDerivedTitles: hasFlag("--include-derived-titles"),
     includeLastMessage: hasFlag("--include-last-message"),
+    includeUnknown: !hasFlag("--exclude-unknown"),
     inflateTranscriptKiB: nonNegativeInt("--inflate-transcript-kib", 0),
     json: hasFlag("--json"),
     keepTemp: hasFlag("--keep-temp"),
+    limit: optionalPositiveInt("--limit"),
     output: flagValue("--output"),
+    recentSessions: optionalNonNegativeInt("--recent-sessions"),
+    recentWindowMinutes: positiveInt("--recent-window-minutes", 1440),
     runs: positiveInt("--runs", DEFAULT_RUNS),
     sessions: positiveInt("--sessions", DEFAULT_SESSIONS),
     sourceRoot: path.resolve(flagValue("--source-root") ?? DEFAULT_SOURCE_ROOT),
     sourceStore: sourceStore ? path.resolve(sourceStore) : undefined,
+    targetWrittenMiB: nonNegativeInt("--target-written-mib", 0),
     warmup: nonNegativeInt("--warmup", DEFAULT_WARMUP),
   };
 }
@@ -104,14 +147,23 @@ Usage:
 
 Options:
   --sessions <count>           Seeded session count (default: ${DEFAULT_SESSIONS})
+  --agent-count <count>        Seed across this many agent dirs
   --source-root <path>         agents directory to clone (default: ${DEFAULT_SOURCE_ROOT})
   --source-store <path>        single sessions.json to clone instead of all agents
   --inflate-transcript-kib <n> Repeat real transcript bytes until each clone is at least n KiB
+  --target-written-mib <n>     Inflate transcripts to write at least this many MiB total
+  --recent-sessions <count>    Keep only this many sessions inside the recent window
+  --recent-window-minutes <n>  Recent window used while seeding timestamps (default: 1440)
+  --limit <count>              Pass sessions.list limit
+  --active-minutes <count>     Pass sessions.list activeMinutes
+  --agent-id <id>              Pass sessions.list agentId
   --cold-runs <count>          Fresh cloned profile runs (default: ${DEFAULT_COLD_RUNS})
   --runs <count>               Measured runs (default: ${DEFAULT_RUNS})
   --warmup <count>             Warmup runs (default: ${DEFAULT_WARMUP})
   --include-derived-titles     Request derived titles
   --include-last-message       Request last-message previews
+  --exclude-global             Do not request global rows
+  --exclude-unknown            Do not request unknown rows
   --keep-temp                  Keep cloned temp profiles on disk
   --json                       Print JSON
   --output <path>              Write JSON report
@@ -146,21 +198,35 @@ function formatMs(value: number): string {
 }
 
 async function callSessionsList(params: {
+  activeMinutes?: number;
+  agentId?: string;
   config: OpenClawConfig;
+  includeGlobal: boolean;
   includeDerivedTitles: boolean;
   includeLastMessage: boolean;
+  includeUnknown: boolean;
+  limit?: number;
   sessionsHandlers: SessionsHandlers;
 }): Promise<SessionsListResult> {
   let payload: SessionsListResult | undefined;
   let error: unknown;
+  const listParams = {
+    includeGlobal: params.includeGlobal,
+    includeUnknown: params.includeUnknown,
+    includeDerivedTitles: params.includeDerivedTitles,
+    includeLastMessage: params.includeLastMessage,
+    ...(params.limit !== undefined ? { limit: params.limit } : {}),
+    ...(params.activeMinutes !== undefined ? { activeMinutes: params.activeMinutes } : {}),
+    ...(params.agentId !== undefined ? { agentId: params.agentId } : {}),
+  };
   await params.sessionsHandlers["sessions.list"]({
-    req: { type: "req", id: "bench-sessions-list", method: "sessions.list", params: {} },
-    params: {
-      includeGlobal: true,
-      includeUnknown: true,
-      includeDerivedTitles: params.includeDerivedTitles,
-      includeLastMessage: params.includeLastMessage,
+    req: {
+      type: "req",
+      id: "bench-sessions-list",
+      method: "sessions.list",
+      params: listParams,
     },
+    params: listParams,
     respond: (ok, response, responseError) => {
       if (!ok) {
         error = responseError;
@@ -184,9 +250,14 @@ async function callSessionsList(params: {
 }
 
 async function measure(params: {
+  activeMinutes?: number;
+  agentId?: string;
   config: OpenClawConfig;
+  includeGlobal: boolean;
   includeDerivedTitles: boolean;
   includeLastMessage: boolean;
+  includeUnknown: boolean;
+  limit?: number;
   sessionsHandlers: SessionsHandlers;
 }): Promise<Sample> {
   const delay = monitorEventLoopDelay({ resolution: 1 });
@@ -213,8 +284,13 @@ for (let index = 0; index < options.coldRuns; index += 1) {
   process.env.OPENCLAW_STATE_DIR = coldSeeded.root;
   const sample = await measure({
     config: coldSeeded.config,
+    activeMinutes: options.activeMinutes,
+    agentId: options.agentId,
+    includeGlobal: options.includeGlobal,
     includeDerivedTitles: options.includeDerivedTitles,
     includeLastMessage: options.includeLastMessage,
+    includeUnknown: options.includeUnknown,
+    limit: options.limit,
     sessionsHandlers,
   });
   coldSamples.push(sample);
@@ -231,7 +307,7 @@ process.env.OPENCLAW_STATE_DIR = seeded.root;
 
 if (!options.json) {
   console.log(
-    `[sessions-list-bench] cloned ${options.sessions} sessions from ${seeded.seed.sourceTranscripts}/${seeded.seed.sourceRows} transcript-backed source rows across ${seeded.seed.sourceStores} stores (${Math.round(seeded.seed.writtenBytes / 1024 / 1024)} MiB written)`,
+    `[sessions-list-bench] cloned ${options.sessions} sessions across ${seeded.seed.targetAgents} agents from ${seeded.seed.sourceTranscripts}/${seeded.seed.sourceRows} transcript-backed source rows across ${seeded.seed.sourceStores} stores (${Math.round(seeded.seed.writtenBytes / 1024 / 1024)} MiB written)`,
   );
 }
 
@@ -239,8 +315,13 @@ const warmups: Sample[] = [];
 for (let index = 0; index < options.warmup; index += 1) {
   const sample = await measure({
     config: seeded.config,
+    activeMinutes: options.activeMinutes,
+    agentId: options.agentId,
+    includeGlobal: options.includeGlobal,
     includeDerivedTitles: options.includeDerivedTitles,
     includeLastMessage: options.includeLastMessage,
+    includeUnknown: options.includeUnknown,
+    limit: options.limit,
     sessionsHandlers,
   });
   warmups.push(sample);
@@ -255,8 +336,13 @@ const samples: Sample[] = [];
 for (let index = 0; index < options.runs; index += 1) {
   const sample = await measure({
     config: seeded.config,
+    activeMinutes: options.activeMinutes,
+    agentId: options.agentId,
+    includeGlobal: options.includeGlobal,
     includeDerivedTitles: options.includeDerivedTitles,
     includeLastMessage: options.includeLastMessage,
+    includeUnknown: options.includeUnknown,
+    limit: options.limit,
     sessionsHandlers,
   });
   samples.push(sample);
@@ -294,7 +380,7 @@ if (options.json) {
     );
   }
   console.log(
-    `[sessions-list-bench] summary: sessions=${options.sessions} min=${formatMs(summary.minMs)} p50=${formatMs(summary.p50Ms)} p95=${formatMs(summary.p95Ms)} max=${formatMs(summary.maxMs)} avg=${formatMs(summary.avgMs)}`,
+    `[sessions-list-bench] summary: sessions=${options.sessions} rows=${samples.at(-1)?.rows ?? 0} min=${formatMs(summary.minMs)} p50=${formatMs(summary.p50Ms)} p95=${formatMs(summary.p95Ms)} max=${formatMs(summary.maxMs)} avg=${formatMs(summary.avgMs)}`,
   );
   if (options.output) {
     console.log(`[sessions-list-bench] wrote ${options.output}`);

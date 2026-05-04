@@ -8,10 +8,14 @@ import { normalizeAgentId } from "../src/routing/session-key.js";
 export const DEFAULT_SOURCE_ROOT = path.join(os.homedir(), ".openclaw", "agents");
 
 export type SeedOptions = {
+  agentCount?: number;
   inflateTranscriptKiB: number;
+  recentSessions?: number;
+  recentWindowMinutes: number;
   sessions: number;
   sourceRoot: string;
   sourceStore?: string;
+  targetWrittenMiB: number;
 };
 
 export type SeedResult = {
@@ -20,11 +24,16 @@ export type SeedResult = {
   seed: {
     clonedBytes: number;
     mode: "real-clone";
+    recentSessions: number;
+    requestedTranscriptInflateKiB: number;
     sourceRows: number;
     sourceStores: number;
     sourceTranscripts: number;
+    targetAgents: number;
+    targetWrittenMiB: number;
     transcriptInflateKiB: number;
     writtenBytes: number;
+    writtenTranscripts: number;
   };
   storePath: string;
 };
@@ -53,6 +62,7 @@ type ClonePlan = {
   index: number;
   maps: CloneRoundMaps;
   source: RealSessionSource;
+  targetAgentId: string;
 };
 
 function inferAgentIdFromStorePath(storePath: string): string {
@@ -148,30 +158,57 @@ function sourceIdentity(source: Pick<RealSessionSource, "agentId" | "key">): str
   return `${source.agentId}\t${source.key}`;
 }
 
-function createRoundMaps(sources: RealSessionSource[], round: number, count: number) {
+function cloneKeyFor(params: { index: number; targetAgentId: string }): string {
+  const padded = String(params.index + 1).padStart(5, "0");
+  return `agent:${params.targetAgentId}:bench-real-${padded}`;
+}
+
+function targetAgentIdForIndex(targetAgentIds: string[], index: number): string {
+  const targetAgentId = targetAgentIds[index % targetAgentIds.length];
+  if (!targetAgentId) {
+    throw new Error("missing benchmark target agent id");
+  }
+  return targetAgentId;
+}
+
+function createRoundMaps(params: {
+  count: number;
+  round: number;
+  sources: RealSessionSource[];
+  targetAgentIds: string[];
+}) {
   const maps: CloneRoundMaps = { byIdentity: new Map(), byKey: new Map() };
-  for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex += 1) {
-    const source = sources[sourceIndex];
+  for (let sourceIndex = 0; sourceIndex < params.sources.length; sourceIndex += 1) {
+    const source = params.sources[sourceIndex];
     if (!source) {
       continue;
     }
-    const index = round * sources.length + sourceIndex;
-    if (index >= count) {
+    const index = params.round * params.sources.length + sourceIndex;
+    if (index >= params.count) {
       break;
     }
-    const padded = String(index + 1).padStart(5, "0");
-    const cloneKey = `agent:${source.agentId}:bench-real-${padded}`;
+    const targetAgentId = targetAgentIdForIndex(params.targetAgentIds, index);
+    const cloneKey = cloneKeyFor({ index, targetAgentId });
     maps.byIdentity.set(sourceIdentity(source), cloneKey);
     maps.byKey.set(source.key, cloneKey);
   }
   return maps;
 }
 
-function buildClonePlans(params: { count: number; sources: RealSessionSource[] }): ClonePlan[] {
+function buildClonePlans(params: {
+  count: number;
+  sources: RealSessionSource[];
+  targetAgentIds: string[];
+}): ClonePlan[] {
   const plans: ClonePlan[] = [];
   const rounds = Math.ceil(params.count / params.sources.length);
   for (let round = 0; round < rounds; round += 1) {
-    const maps = createRoundMaps(params.sources, round, params.count);
+    const maps = createRoundMaps({
+      count: params.count,
+      round,
+      sources: params.sources,
+      targetAgentIds: params.targetAgentIds,
+    });
     for (let sourceIndex = 0; sourceIndex < params.sources.length; sourceIndex += 1) {
       const index = round * params.sources.length + sourceIndex;
       if (index >= params.count) {
@@ -182,11 +219,12 @@ function buildClonePlans(params: { count: number; sources: RealSessionSource[] }
       if (!source) {
         continue;
       }
+      const targetAgentId = targetAgentIdForIndex(params.targetAgentIds, index);
       const cloneKey = maps.byIdentity.get(sourceIdentity(source));
       if (!cloneKey) {
         throw new Error(`missing clone key for ${source.key}`);
       }
-      const cloneSessionId = `bench-${source.agentId}-${padded}`;
+      const cloneSessionId = `bench-${targetAgentId}-${padded}`;
       plans.push({
         cloneKey,
         cloneSessionFile: `${cloneSessionId}.jsonl`,
@@ -194,6 +232,7 @@ function buildClonePlans(params: { count: number; sources: RealSessionSource[] }
         index,
         maps,
         source,
+        targetAgentId,
       });
     }
   }
@@ -253,21 +292,60 @@ function createBenchConfig(root: string, agentIds: string[]): OpenClawConfig {
   };
 }
 
+function resolveTargetAgentIds(sources: RealSessionSource[], agentCount?: number): string[] {
+  const sourceAgentIds = [...new Set(sources.map((source) => source.agentId))].sort();
+  const count = agentCount ?? sourceAgentIds.length;
+  const targetAgentIds = sourceAgentIds.slice(0, count);
+  for (let index = 1; targetAgentIds.length < count; index += 1) {
+    const agentId = normalizeAgentId(`bench-agent-${String(index).padStart(3, "0")}`);
+    if (!targetAgentIds.includes(agentId)) {
+      targetAgentIds.push(agentId);
+    }
+  }
+  return targetAgentIds;
+}
+
+function resolveTranscriptInflateBytes(options: SeedOptions): number {
+  const requestedInflateBytes = options.inflateTranscriptKiB * 1024;
+  const targetBytes =
+    options.targetWrittenMiB > 0
+      ? Math.ceil((options.targetWrittenMiB * 1024 * 1024) / options.sessions)
+      : 0;
+  return Math.max(requestedInflateBytes, targetBytes);
+}
+
+function resolveCloneUpdatedAt(params: { index: number; now: number; options: SeedOptions }) {
+  const recentSessions = Math.min(
+    params.options.sessions,
+    params.options.recentSessions ?? params.options.sessions,
+  );
+  const recentWindowMs = params.options.recentWindowMinutes * 60_000;
+  if (params.index < recentSessions) {
+    return params.now - Math.floor((params.index / Math.max(1, recentSessions)) * recentWindowMs);
+  }
+  return params.now - recentWindowMs - (params.index - recentSessions + 1) * 60_000;
+}
+
 export function seedRealSessions(options: SeedOptions): SeedResult {
   const { rows, sources, sourceStores } = loadRealSessionSources(options);
   if (sources.length === 0) {
     throw new Error(`no cloneable transcript-backed sessions under ${options.sourceRoot}`);
   }
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sessions-list-bench-"));
-  const agentIds = [...new Set(sources.map((source) => source.agentId))].sort();
+  const agentIds = resolveTargetAgentIds(sources, options.agentCount);
   const stores = new Map<string, Record<string, SessionEntry>>();
   let clonedBytes = 0;
   let writtenBytes = 0;
-  const inflateBytes = options.inflateTranscriptKiB * 1024;
+  let writtenTranscripts = 0;
+  const inflateBytes = resolveTranscriptInflateBytes(options);
   const now = Date.now();
 
-  for (const plan of buildClonePlans({ count: options.sessions, sources })) {
-    const sessionsDir = path.join(root, "agents", plan.source.agentId, "sessions");
+  for (const plan of buildClonePlans({
+    count: options.sessions,
+    sources,
+    targetAgentIds: agentIds,
+  })) {
+    const sessionsDir = path.join(root, "agents", plan.targetAgentId, "sessions");
     fs.mkdirSync(sessionsDir, { recursive: true });
     const copied = copyTranscript({
       inflateBytes,
@@ -276,7 +354,8 @@ export function seedRealSessions(options: SeedOptions): SeedResult {
     });
     clonedBytes += copied.sourceBytes;
     writtenBytes += copied.writtenBytes;
-    const store = stores.get(plan.source.agentId) ?? {};
+    writtenTranscripts += 1;
+    const store = stores.get(plan.targetAgentId) ?? {};
     store[plan.cloneKey] = {
       ...plan.source.entry,
       parentSessionKey: remapSessionLink(
@@ -287,9 +366,9 @@ export function seedRealSessions(options: SeedOptions): SeedResult {
       sessionFile: plan.cloneSessionFile,
       sessionId: plan.cloneSessionId,
       spawnedBy: remapSessionLink(plan.source.entry.spawnedBy, plan.source, plan.maps),
-      updatedAt: now - plan.index * 1000,
+      updatedAt: resolveCloneUpdatedAt({ index: plan.index, now, options }),
     };
-    stores.set(plan.source.agentId, store);
+    stores.set(plan.targetAgentId, store);
   }
 
   for (const [agentId, store] of stores) {
@@ -304,11 +383,16 @@ export function seedRealSessions(options: SeedOptions): SeedResult {
     seed: {
       clonedBytes,
       mode: "real-clone",
+      recentSessions: Math.min(options.sessions, options.recentSessions ?? options.sessions),
+      requestedTranscriptInflateKiB: options.inflateTranscriptKiB,
       sourceRows: rows,
       sourceStores,
       sourceTranscripts: sources.length,
-      transcriptInflateKiB: options.inflateTranscriptKiB,
+      targetAgents: agentIds.length,
+      targetWrittenMiB: options.targetWrittenMiB,
+      transcriptInflateKiB: Math.ceil(inflateBytes / 1024),
       writtenBytes,
+      writtenTranscripts,
     },
   };
 }
